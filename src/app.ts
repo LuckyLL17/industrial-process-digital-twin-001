@@ -1,0 +1,68 @@
+import Fastify from 'fastify';
+import { randomUUID } from 'node:crypto';
+
+type Telemetry = { time:string; assetId:string; values:Record<string,number>; quality:'good'|'suspect'|'bad' };
+type Asset = { id:string; name:string; type:string; parentId?:string; limits:Record<string,{min:number;max:number}>; state:'running'|'degraded'|'stopped'; last:Record<string,number> };
+type Anomaly = { id:string; time:string; assetId:string; variable:string; value:number; score:number; severity:'low'|'medium'|'high'; status:'open'|'investigating'|'resolved'; causes:string[] };
+const now=()=>new Date().toISOString();
+
+export function buildApp(opts:{logger?:boolean}={}){
+const app=Fastify({logger:opts.logger??true});
+const assets:Asset[]=[
+ {id:'reactor-01',name:'连续反应器 R-01',type:'reactor',limits:{temperature:{min:68,max:82},pressure:{min:2.2,max:3.2},flow:{min:90,max:120}},state:'running',last:{temperature:75,pressure:2.7,flow:108,vibration:1.2}},
+ {id:'pump-01',name:'进料泵 P-01',type:'pump',parentId:'reactor-01',limits:{pressure:{min:1.8,max:3.6},flow:{min:90,max:125},vibration:{min:0,max:3}},state:'running',last:{pressure:2.8,flow:108,vibration:1.2}},
+ {id:'heater-01',name:'预热器 H-01',type:'heater',parentId:'reactor-01',limits:{temperature:{min:120,max:180},power:{min:20,max:90}},state:'running',last:{temperature:145,power:54}}
+];
+const telemetry:Telemetry[]=[]; const anomalies:Anomaly[]=[]; const investigations:any[]=[]; const scenarios:any[]=[]; const workOrders:any[]=[]; const audit:any[]=[];
+const causalEdges=[
+ {from:'pump-01',to:'reactor-01',relation:'feeds'}, {from:'heater-01',to:'reactor-01',relation:'conditions'},
+ {from:'low-flow',to:'temperature-drift',relation:'causes',weight:.71}, {from:'high-vibration',to:'low-flow',relation:'causes',weight:.64},
+ {from:'valve-stiction',to:'low-flow',relation:'causes',weight:.52}
+];
+function log(action:string,entity:string,payload:any){audit.push({id:randomUUID(),time:now(),action,entity,payload});}
+function detect(t:Telemetry){ for(const [variable,value] of Object.entries(t.values)){const asset=assets.find(a=>a.id===t.assetId); const lim=asset?.limits[variable]; if(!lim) continue; const span=lim.max-lim.min; const distance=value<lim.min?lim.min-value:value>lim.max?value-lim.max:0; if(distance>0){const score=Math.min(1,.45+distance/(span||1)); const a:Anomaly={id:randomUUID(),time:t.time,assetId:t.assetId,variable,value,score,severity:score>.8?'high':score>.6?'medium':'low',status:'open',causes:variable==='flow'?['high-vibration','valve-stiction']:['low-flow','sensor-bias']}; anomalies.push(a); const target=assets.find(x=>x.id===t.assetId); if(target) target.state=a.severity==='high'?'degraded':target.state; }} }
+for(const asset of assets) telemetry.push({time:now(),assetId:asset.id,values:asset.last,quality:'good'});
+app.get('/health',async()=>({ok:true,service:'industrial-process-digital-twin',time:now()}));
+app.get('/api/twin/state',async()=>({at:now(),assets,openAnomalies:anomalies.filter(a=>a.status!=='resolved'),process:{throughput:108.4,energy:54.2,quality:97.8},causalEdges}));
+app.post('/api/telemetry/ingest',async(req:any,res)=>{const body=req.body as Partial<Telemetry>; if(!body.assetId||!body.values) return res.code(400).send({error:'assetId 和 values 必填'}); const item:Telemetry={time:body.time||now(),assetId:body.assetId,values:body.values,quality:body.quality||'good'}; telemetry.push(item); const asset=assets.find(a=>a.id===item.assetId); if(!asset) return res.code(404).send({error:'asset not found'}); asset.last={...asset.last,...item.values}; detect(item); log('telemetry.ingest',item.assetId,item); return {accepted:true,anomalies:anomalies.filter(a=>a.time===item.time&&a.assetId===item.assetId)};});
+app.get('/api/telemetry/replay',async(req:any)=>{const q=req.query as any; const from=Number(q.from||0), to=Number(q.to||Date.now()); return {items:telemetry.filter(t=>{const x=Date.parse(t.time);return x>=from&&x<=to}),cursor:{from,to,next:to+1}};});
+app.get('/api/anomalies',async(req:any)=>{const q=req.query as any; return anomalies.filter(a=>(!q.status||a.status===q.status)&&(!q.severity||a.severity===q.severity));});
+app.post('/api/anomalies/:id/investigate',async(req:any,res)=>{const a=anomalies.find(x=>x.id===(req.params as any).id); if(!a)return res.code(404).send({error:'anomaly not found'}); a.status='investigating'; const inv={id:randomUUID(),anomalyId:a.id,createdAt:now(),hypotheses:a.causes.map((cause,i)=>({id:randomUUID(),cause,prior:.6-i*.12,evidence:[],status:'open'})),tests:[],status:'open'}; investigations.push(inv); log('investigation.create',inv.id,inv); return inv;});
+app.post('/api/investigations/:id/evidence',async(req:any,res)=>{const inv=investigations.find(x=>x.id===(req.params as any).id); if(!inv)return res.code(404).send({error:'investigation not found'}); const b=req.body as any; if(!b.hypothesisId||!b.observation)return res.code(400).send({error:'hypothesisId 和 observation 必填'}); const h=inv.hypotheses.find((x:any)=>x.id===b.hypothesisId); if(!h)return res.code(404).send({error:'hypothesis not found'}); h.evidence.push({id:randomUUID(),observation:b.observation,likelihood:Number(b.likelihood??.5),time:now()}); h.posterior=Number((h.prior*Number(b.likelihood??.5)).toFixed(4)); if(b.supports===false) h.posterior=0; inv.hypotheses.sort((x:any,y:any)=>(y.posterior??y.prior)-(x.posterior??x.prior)); log('investigation.evidence',inv.id,b); return inv;});
+app.post('/api/scenarios',async(req:any,res)=>{const b=req.body as any; if(!b.name||!b.overrides)return res.code(400).send({error:'name 和 overrides 必填'}); const s={id:randomUUID(),name:b.name,baseAt:now(),overrides:b.overrides,status:'draft',result:null}; scenarios.push(s); return s;});
+app.post('/api/scenarios/:id/run',async(req:any,res)=>{const s=scenarios.find(x=>x.id===(req.params as any).id); if(!s)return res.code(404).send({error:'scenario not found'}); const ov=s.overrides as Record<string,number>; const flow=Number(ov.flow??108), temp=Number(ov.temperature??75), pressure=Number(ov.pressure??2.7), vibration=Number(ov.vibration??1.2); const quality=Math.max(0,Math.min(100,99.4-Math.abs(flow-108)*.08-Math.abs(temp-75)*.11-Math.max(0,vibration-1.5)*2)); s.status='simulated'; s.result={throughput:flow*.996,quality:Number(quality.toFixed(2)),energy:Number((54+Math.abs(temp-75)*.5+pressure*1.2).toFixed(2)),risk:{thermal:temp>82?.82:.12,hydraulic:flow<90?.9:.18,mechanical:vibration>3?.88:.1},constraintViolations:[...(temp<68||temp>82?['reactor.temperature']:[]),...(flow<90||flow>120?['reactor.flow']:[])]}; log('scenario.run',s.id,s.result); return s;});
+app.get('/api/causal-graph/:id',async(req:any)=>({rootId:(req.params as any).id,nodes:[...new Set(causalEdges.flatMap(e=>[e.from,e.to]))].map(id=>({id,label:id})),edges:causalEdges}));
+app.post('/api/work-orders',async(req:any,res)=>{const b=req.body as any; if(!b.assetId||!b.reason)return res.code(400).send({error:'assetId 和 reason 必填'}); const w={id:randomUUID(),assetId:b.assetId,reason:b.reason,priority:b.priority||'medium',status:'planned',createdAt:now(),requiredSkills:b.requiredSkills||[],lockoutRequired:Boolean(b.lockoutRequired)}; workOrders.push(w); log('work-order.create',w.id,w); return w;});
+app.post('/api/anomalies/:id/resolve',async(req:any,res)=>{const a=anomalies.find(x=>x.id===(req.params as any).id);if(!a)return res.code(404).send({error:'anomaly not found'}); const b=req.body as any;if(!b.evidence)return res.code(400).send({error:'resolution evidence required'});a.status='resolved';log('anomaly.resolve',a.id,b);return a;});
+app.get('/api/audit',async()=>audit.slice(-100));
+
+// Advanced operations: recipe governance, closed-loop control, maintenance windows and safety gates.
+const recipes:any[]=[{id:'recipe-r1-v3',assetId:'reactor-01',version:3,status:'approved',parameters:{temperature:75,pressure:2.7,flow:108},approvedBy:'process-engineering',approvedAt:now(),supersedes:'recipe-r1-v2'}];
+const controlCommands:any[]=[]; const maintenanceWindows:any[]=[]; const changeRequests:any[]=[];
+function recipeRisk(parameters:Record<string,number>){const violations:string[]=[];const r=assets.find(x=>x.id==='reactor-01')!;for(const k of ['temperature','pressure','flow']){const lim=r.limits[k];if(parameters[k]!=null&&(parameters[k]<lim.min||parameters[k]>lim.max))violations.push(`${k} outside operating envelope`)}const coupling=Math.abs((parameters.flow??108)-108)*.012+Math.abs((parameters.temperature??75)-75)*.018;return{violations,riskScore:Number(Math.min(1,coupling+(parameters.pressure??2.7)>3.1?.18:0).toFixed(3))};}
+app.get('/api/recipes',async()=>recipes);
+app.post('/api/recipes',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.parameters)return res.code(400).send({error:'assetId 和 parameters 必填'});const previous=recipes.filter(x=>x.assetId===b.assetId).sort((a,b)=>b.version-a.version)[0];const risk=recipeRisk(b.parameters);const r={id:randomUUID(),assetId:b.assetId,version:(previous?.version||0)+1,status:risk.violations.length?'rejected':'pending-approval',parameters:b.parameters,risk,createdAt:now(),supersedes:previous?.id||null};recipes.push(r);log('recipe.create',r.id,r);return r;});
+app.post('/api/recipes/:id/approve',async(req:any,res)=>{const r=recipes.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'recipe not found'});if(r.risk.violations.length)return res.code(409).send({error:'recipe violates operating envelope',violations:r.risk.violations});r.status='approved';r.approvedBy=(req.body as any)?.approvedBy||'shift-supervisor';r.approvedAt=now();log('recipe.approve',r.id,r);return r;});
+app.post('/api/recipes/:id/what-if',async(req:any,res)=>{const r=recipes.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'recipe not found'});const params={...r.parameters,...((req.body as any)?.overrides||{})};const risk=recipeRisk(params);return{recipeId:r.id,units:{temperature:'°C',pressure:'bar',flow:'m3/h'},parameters:params,risk,estimated:{throughput:Number((params.flow*.996).toFixed(2)),quality:Number(Math.max(0,99.2-risk.riskScore*28).toFixed(2)),energy:Number((54+Math.abs(params.temperature-75)*.5+params.pressure*1.2).toFixed(2))}};});
+app.post('/api/control/commands',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.parameters)return res.code(400).send({error:'assetId 和 parameters 必填'});const risk=recipeRisk(b.parameters);if(risk.violations.length)return res.code(409).send({error:'command rejected by operating envelope',violations:risk.violations});const activeHigh=anomalies.some(a=>a.status!=='resolved'&&a.severity==='high'&&a.assetId===b.assetId);if(activeHigh&&!b.overrideReason)return res.code(409).send({error:'high severity anomaly requires overrideReason'});const c={id:randomUUID(),assetId:b.assetId,parameters:b.parameters,mode:b.mode||'supervised',status:'accepted',risk,issuedAt:now(),expiresAt:new Date(Date.now()+Number(b.ttlSeconds||60)*1000).toISOString()};controlCommands.push(c);log('control-command.accept',c.id,c);return c;});
+app.post('/api/maintenance/windows',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.start||!b.end)return res.code(400).send({error:'assetId、start、end 必填'});const window={id:randomUUID(),assetId:b.assetId,start:b.start,end:b.end,requiredLockout:Boolean(b.requiredLockout??true),checks:{downstreamImpact:Boolean(b.downstreamImpact),sparesReady:Boolean(b.sparesReady)},status:'planned'};maintenanceWindows.push(window);return window;});
+app.post('/api/maintenance/:id/execute',async(req:any,res)=>{
+ const w=maintenanceWindows.find(x=>x.id===(req.params as any).id);
+ if(!w)return res.code(404).send({error:'maintenance window not found'});
+ // Idempotent: an already-executed window returns its recorded state without side effects.
+ if(w.status!=='planned')return w;
+ // Safety gates: downstream impact, spares and LOTO must all pass before any state change or audit record.
+ if(!w.checks.downstreamImpact)return res.code(409).send({error:'downstream impact assessment required before execution'});
+ if(!w.checks.sparesReady)return res.code(409).send({error:'spares readiness check failed'});
+ if(w.requiredLockout&&!(req.body as any)?.lockoutConfirmed)return res.code(409).send({error:'lockout confirmation required'});
+ const a=assets.find(x=>x.id===w.assetId);
+ if(a)a.state='stopped';
+ w.status='executing';
+ w.executedAt=now();
+ log('maintenance.execute',w.id,w);
+ return w;
+});
+app.get('/api/process/health-score',async()=>{const degraded=assets.filter(a=>a.state!=='running').length;const high=anomalies.filter(a=>a.status!=='resolved'&&a.severity==='high').length;const stale=telemetry.filter(t=>Date.now()-Date.parse(t.time)>15*60*1000).length;return{score:Number(Math.max(0,100-degraded*18-high*25-stale*2).toFixed(1)),components:{assetAvailability:assets.length?1-degraded/assets.length:1,criticalAnomalies:high,dataFreshness:telemetry.length?1-stale/telemetry.length:1},at:now()};});
+
+return app;
+}
