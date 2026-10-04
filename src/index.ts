@@ -44,7 +44,35 @@ app.post('/api/recipes/:id/approve',async(req:any,res)=>{const r=recipes.find(x=
 app.post('/api/recipes/:id/what-if',async(req:any,res)=>{const r=recipes.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'recipe not found'});const params={...r.parameters,...((req.body as any)?.overrides||{})};const risk=recipeRisk(params);return{recipeId:r.id,units:{temperature:'°C',pressure:'bar',flow:'m3/h'},parameters:params,risk,estimated:{throughput:Number((params.flow*.996).toFixed(2)),quality:Number(Math.max(0,99.2-risk.riskScore*28).toFixed(2)),energy:Number((54+Math.abs(params.temperature-75)*.5+params.pressure*1.2).toFixed(2))}};});
 app.post('/api/control/commands',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.parameters)return res.code(400).send({error:'assetId 和 parameters 必填'});const risk=recipeRisk(b.parameters);if(risk.violations.length)return res.code(409).send({error:'command rejected by operating envelope',violations:risk.violations});const activeHigh=anomalies.some(a=>a.status!=='resolved'&&a.severity==='high'&&a.assetId===b.assetId);if(activeHigh&&!b.overrideReason)return res.code(409).send({error:'high severity anomaly requires overrideReason'});const c={id:randomUUID(),assetId:b.assetId,parameters:b.parameters,mode:b.mode||'supervised',status:'accepted',risk,issuedAt:now(),expiresAt:new Date(Date.now()+Number(b.ttlSeconds||60)*1000).toISOString()};controlCommands.push(c);log('control-command.accept',c.id,c);return c;});
 app.post('/api/maintenance/windows',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.start||!b.end)return res.code(400).send({error:'assetId、start、end 必填'});const window={id:randomUUID(),assetId:b.assetId,start:b.start,end:b.end,requiredLockout:Boolean(b.requiredLockout??true),checks:{downstreamImpact:Boolean(b.downstreamImpact),sparesReady:Boolean(b.sparesReady)},status:'planned'};maintenanceWindows.push(window);return window;});
-app.post('/api/maintenance/:id/execute',async(req:any,res)=>{const w=maintenanceWindows.find(x=>x.id===(req.params as any).id);if(!w)return res.code(404).send({error:'maintenance window not found'});if(!w.checks.sparesReady)return res.code(409).send({error:'spares readiness check failed'});if(w.requiredLockout&&!(req.body as any)?.lockoutConfirmed)return res.code(409).send({error:'lockout confirmation required'});const a=assets.find(x=>x.id===w.assetId);if(a)a.state='stopped';w.status='executing';w.executedAt=now();log('maintenance.execute',w.id,w);return w;});
+app.post('/api/maintenance/:id/execute',async(req:any,res)=>{
+ const w=maintenanceWindows.find(x=>x.id===(req.params as any).id);
+ if(!w)return res.code(404).send({error:'maintenance window not found'});
+ // Idempotent: a window already entering execution must not re-stop assets or append another execution audit.
+ if(w.status==='executing'||w.status==='executed')return w;
+ // Safety gate: downstream impact acknowledged, spares on site, and LOTO (when required) must ALL be satisfied.
+ const body=req.body as any;
+ const missing:string[]=[];
+ if(!w.checks.downstreamImpact)missing.push('downstreamImpact');
+ if(!w.checks.sparesReady)missing.push('sparesReady');
+ if(w.requiredLockout&&!body?.lockoutConfirmed)missing.push('lockoutConfirmed');
+ if(missing.length){
+  // Gate failure is immutable until a retry passes: no asset state change, no successful execution record.
+  log('maintenance.execute.denied',w.id,{missing,attemptedAt:now()});
+  return res.code(409).send({error:'maintenance safety gate failed',missing,gate:'downstreamImpact,sparesReady,lockoutConfirmed'});
+ }
+ const a=assets.find(x=>x.id===w.assetId);
+ if(a)a.state='stopped';
+ w.status='executing';
+ w.executedAt=now();
+ w.lockoutConfirmed=true;
+ log('maintenance.execute',w.id,w);
+ return w;
+});
 app.get('/api/process/health-score',async()=>{const degraded=assets.filter(a=>a.state!=='running').length;const high=anomalies.filter(a=>a.status!=='resolved'&&a.severity==='high').length;const stale=telemetry.filter(t=>Date.now()-Date.parse(t.time)>15*60*1000).length;return{score:Number(Math.max(0,100-degraded*18-high*25-stale*2).toFixed(1)),components:{assetAvailability:assets.length?1-degraded/assets.length:1,criticalAnomalies:high,dataFreshness:telemetry.length?1-stale/telemetry.length:1},at:now()};});
 
-app.listen({port:Number(process.env.PORT||6301),host:'127.0.0.1'}).catch(err=>{app.log.error(err);process.exit(1)});
+export {app};
+
+const isMain=(()=>{try{return process.argv[1]?new URL(`file://${process.argv[1]}`).href===import.meta.url:false;}catch{return false;}})();
+if(isMain){
+ app.listen({port:Number(process.env.PORT||6301),host:'127.0.0.1'}).catch(err=>{app.log.error(err);process.exit(1)});
+}
